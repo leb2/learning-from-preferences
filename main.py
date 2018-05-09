@@ -35,17 +35,58 @@ class ActorCritic(ABC):
 
 
 class BasicActorCritic(ActorCritic):
+    def __init__(self, game, architecture=(32, 32), shared_architecture=()):
+        super().__init__(game)
+        self.architecture = architecture
+        self.shared_architecture = shared_architecture
+
+    def shared_layers(self, state):
+        with tf.variable_scope('shared', reuse=tf.AUTO_REUSE):
+            for i, layer_size in enumerate(self.shared_architecture):
+                state = tf.layers.dense(state, layer_size, activation=tf.nn.tanh, name='shared%d' % i)
+        return state
+
     def critic(self, state):
+        state = self.shared_layers(state)
         with tf.variable_scope('critic', reuse=tf.AUTO_REUSE):
-            state = tf.layers.dense(state, 8, activation=tf.nn.relu, name='critic1')
-            state = tf.layers.dense(state, 1, activation=None, name='critic2')
+            for i, layer_size in enumerate(self.architecture):
+                state = tf.layers.dense(state, layer_size, activation=tf.nn.tanh, name='critic%d' % i)
+            state = tf.layers.dense(state, 1, activation=None, name='output')
         return tf.squeeze(state)
 
     def actor(self, state):
+        state = self.shared_layers(state)
         with tf.variable_scope('actor', reuse=tf.AUTO_REUSE):
-            logits = tf.layers.dense(state, units=8, activation=tf.nn.relu, name='layer1')
-            probs = tf.layers.dense(logits, units=self.num_actions, activation=tf.nn.softmax, name='output')
+            for i, layer_size in enumerate(self.architecture):
+                state = tf.layers.dense(state, layer_size, activation=tf.nn.tanh, name='layer%d' % i)
+            probs = tf.layers.dense(state, units=self.num_actions, activation=tf.nn.softmax, name='output')
         return probs
+
+
+class ConvActorCritic(ActorCritic):
+    def __init__(self, game):
+        super().__init__(game)
+
+    @staticmethod
+    def shared_layers(state):
+        with tf.variable_scope('ac_shared', reuse=tf.AUTO_REUSE):
+            logits = tf.layers.conv2d(state, 16, kernel_size=7, strides=3, activation=tf.nn.leaky_relu, name='c1')
+            logits = tf.layers.conv2d(logits, 16, kernel_size=5, strides=2, activation=tf.nn.leaky_relu, name='c2')
+            logits = tf.layers.conv2d(logits, 16, kernel_size=3, activation=tf.nn.leaky_relu, name='c3')
+            logits = tf.layers.conv2d(logits, 16, kernel_size=3, activation=tf.nn.leaky_relu, name='c4')
+            logits = tf.layers.flatten(logits)
+            logits = tf.layers.dense(logits, units=64, activation=tf.nn.leaky_relu, name='d1')
+        return logits
+
+    def critic(self, state):
+        features = self.shared_layers(state)
+        with tf.variable_scope('critic', reuse=tf.AUTO_REUSE):
+            return tf.layers.dense(features, units=1, activation=None, name='output')
+
+    def actor(self, state):
+        features = self.shared_layers(state)
+        with tf.variable_scope('actor', reuse=tf.AUTO_REUSE):
+            return tf.layers.dense(features, units=self.num_actions, activation=tf.nn.softmax, name='output')
 
 
 class Learner:
@@ -53,7 +94,7 @@ class Learner:
         tf.reset_default_graph()
         self.batch_size = 30
         self.game = game
-        self.gamma = 0.99
+        self.gamma = 1
 
         self.num_actions = game.action_space.n
         self.state_shape = game.observation_space.shape
@@ -68,11 +109,13 @@ class Learner:
         self.reward_mean = tf.placeholder(tf.float32, [], name='reward_mean')
         self.reward_std = tf.placeholder(tf.float32, [], name='reward_std')
         self.reward_input = tf.placeholder(tf.float32, [None], name='reward_input')
+        self.discounted_reward_input = tf.placeholder(tf.float32, [None], name='discounted_reward_input')
 
-        self.actor_critic = BasicActorCritic(self.game)
+        # self.actor_critic = BasicActorCritic(self.game, shared_architecture=(32, 32), architecture=())
+        self.actor_critic = BasicActorCritic(self.game, shared_architecture=[], architecture=[64, 64])
 
-        actions_onehot = tf.one_hot(self.actions_input, self.num_actions)
-        self.predicted_rewards = self.reward(self.state_input, actions_onehot)
+        actions_one_hot = tf.one_hot(self.actions_input, self.num_actions)
+        self.predicted_rewards = self.reward(self.state_input, actions_one_hot)
 
         # -- CRITIC -- #
         state_value = self.actor_critic.critic(self.state_input)
@@ -81,19 +124,33 @@ class Learner:
         normalized_reward = self.reward_input
 
         # One-step Advantage
-        # advantage = state_value - normalized_reward - tf.concat([state_value[1:], [0]], axis=0)
+        next_state_value = self.gamma * tf.concat([state_value[1:], [0]], axis=0)
+        td_advantage = normalized_reward + next_state_value - state_value
+
+        self.next_state_value = next_state_value
 
         # Monte Carlo Advantage
-        cumulative = tf.cumsum(normalized_reward, reverse=True)
-        advantage = cumulative - tf.squeeze(state_value)
-        critic_loss = tf.reduce_mean(tf.square(advantage))
+        # cumulative = tf.cumsum(normalized_reward, reverse=True)
+        # advantage = cumulative - tf.squeeze(state_value)
+        mc_advantage = self.discounted_reward_input - state_value
+
+        self.state_value = state_value
+        self.td_advantage = td_advantage
+        self.mc_advantage = mc_advantage
 
         # -- ACTOR -- #
         output = self.actor_critic.actor(self.state_input)
-        action_probs = tf.reduce_sum(output * actions_onehot, axis=1)
+        action_probs = tf.reduce_sum(output * actions_one_hot, axis=1)
 
         # -- TRAINING -- #
-        self.loss = -tf.reduce_mean(tf.log(action_probs) * advantage) + critic_loss
+        self.entropy_bonus = tf.reduce_mean(0.01 * self.entropy(output))
+
+        # self.critic_loss = tf.reduce_mean(tf.square(advantage))
+        self.critic_loss = tf.reduce_mean(tf.square(td_advantage))
+        self.actor_loss = -tf.reduce_mean(tf.log(action_probs) * tf.stop_gradient(td_advantage))
+
+        self.loss = self.actor_loss - self.entropy_bonus + self.critic_loss
+
         optimizer = tf.train.AdamOptimizer(learning_rate=0.001)
         self.train_op = optimizer.minimize(self.loss)
 
@@ -123,47 +180,73 @@ class Learner:
         # -- INFERENCE -- #
         self.state_inf = tf.placeholder(tf.float32, shape=[*self.state_shape])
         state_inf = tf.expand_dims(self.state_inf, axis=0)
-        self.output_inf = self.actor_critic.actor(state_inf)
+        self.output_inf = tf.squeeze(self.actor_critic.actor(state_inf))
 
         self.session = tf.Session()
         self.session.run(tf.global_variables_initializer())
+        self.saver = tf.train.Saver()
+
+    def save_model(self):
+        save_path = self.saver.save(self.session, 'saves/model.ckpt')
+        print("Model Saved in %s" % save_path)
+
+    def load_model(self):
+        self.saver.restore(self.session, 'saves/model.ckpt')
+        print('Model Loaded')
+
+    @staticmethod
+    def entropy(probs):
+        # return tf.reduce_sum(tf.log(1 - probs + 0.0001), axis=-1)
+        return -tf.reduce_sum(probs * tf.log(probs + 0.0000001), axis=-1)
 
     @staticmethod
     def reward(states, actions):
         with tf.variable_scope('reward', reuse=tf.AUTO_REUSE):
-            state_action = tf.concat([states, actions], axis=-1)
+            # state_action = tf.concat([states, actions], axis=-1)
             # logits = tf.layers.dense(state_action, 8, name='layer1', activation=tf.nn.relu)
-            logits = tf.layers.dense(state_action, 1, name='output')
+            logits = tf.layers.dense(actions, 1, name='output')
         return tf.squeeze(logits)
 
-    def generate_trajectory(self, render=False):
+    def generate_trajectory(self, render=False, greedy=False):
         state = self.game.reset()
         rewards, actions, states = [], [], []
         total_reward = 0
-        for steps in range(1000):
+        for step in range(3000):
             if render:
                 self.game.render()
             probabilities = self.session.run(self.output_inf, feed_dict={
                 self.state_inf: state
             })
 
-            action = np.random.choice(self.num_actions, p=probabilities[0])
+            if greedy:
+                action = np.argmax(probabilities)
+            else:
+                action = np.random.choice(self.num_actions, p=probabilities)
+            # action = np.random.choice(self.num_actions)
 
             actions.append(action)
             states.append(state)
             state, reward, done, _ = self.game.step(action)
+
             rewards.append(reward)
             total_reward += reward
 
             if done:
                 break
-            if render:
-                self.game.close()
+        if render:
+            self.game.close()
+
         return np.array(states), np.array(actions), np.array(rewards), total_reward
 
     def train_policy(self, num_iterations=1):
         average = 0
+        average_loss = 0
+
+        losses = np.zeros(3)
+
         for i in range(num_iterations):
+            # sys.stdout.write("game: %d of %d \r" % (i, num_iterations))
+
             states, actions, rewards, total_reward = self.generate_trajectory()
             discounted_rewards = [0.0]
 
@@ -173,20 +256,30 @@ class Learner:
             for j in range(1, len(rewards)):
                 discounted_rewards.append(float(discounted_rewards[j - 1] - rewards[j - 1]) / self.gamma)
 
-            fetches = [self.loss, self.predicted_rewards, self.train_op]
-            loss, predicted_rewards, _ = self.session.run(fetches, feed_dict={
+            fetches = [self.loss, self.predicted_rewards, self.train_op,
+                       self.actor_loss, self.critic_loss, self.entropy_bonus,
+                       self.td_advantage, self.mc_advantage, self.state_value, self.next_state_value]
+
+            results = self.session.run(fetches, feed_dict={
                 self.state_input: np.array(states),
                 self.actions_input: np.array(actions),
                 self.reward_input: np.array(rewards),
+                self.discounted_reward_input: np.array(discounted_rewards),
                 self.reward_mean: np.mean(self.prev_rewards),
                 self.reward_std: np.std(self.prev_rewards) + 0.00001
             })
+            loss, predicted_rewards, _, actor_loss, critic_loss, entropy_bonus = results[:6]
+            td_advantage, mc_advantage, state_values, next_state_value = results[6:]
 
             self.prev_rewards = self.prev_rewards + list(predicted_rewards)
             self.prev_rewards = self.prev_rewards[-100:]
+            losses += np.array([actor_loss, critic_loss, entropy_bonus])
 
+            average_loss += loss
             average += total_reward
-        return average / num_iterations
+
+        print("Actor Loss: %.3f\t Critic Loss %.3f\t Entropy Bonus %.3f" % tuple(losses / num_iterations))
+        return average / num_iterations, average_loss / num_iterations
 
     def train_reward(self):
         num_prev = 100
@@ -208,7 +301,7 @@ class Learner:
             if i % ratio == 0:
                 total_loss += self.train_reward()
                 count_reward += 1
-            total_reward += self.train_policy(1)
+            total_reward += self.train_policy(1)[0]
         return total_reward / iterations, total_loss / count_reward
 
     def get_human_preference(self):
@@ -250,35 +343,48 @@ class Learner:
 
 
 def main():
-    # learner = Learner(gym.make('MountainCar-v0'))
-    learner = Learner(gym.make('CartPole-v0'))
+    # environment = gym.make('Assault-ram-v0')
+    # environment = gym.make('CartPole-v0')
+    # environment = gym.make('MountainCar-v0')
+    environment = gym.make('Pong-ram-v0')
+    # learner = Learner(gym.make('LunarLander-v2'))
 
-    for i in range(30):
-        learner.get_human_preference()
+    learner = Learner(environment)
+    # learner.load_model()
 
-    for i in range(30):
-        learner.get_human_preference()
-        reward, loss = learner.train_both(iterations=100, ratio=5)
-        print("Reward: %.3f\t Reward Loss: %.3f" % (reward, loss))
+    # for i in range(30):
+    #     learner.get_human_preference()
 
-    states, actions, length, total_reward = learner.generate_segment()
-    predicted = learner.session.run([learner.predicted_rewards], feed_dict={
-        learner.state_input: states,
-        learner.actions_input: actions
-    })
+    for i in range(1000):
+        reward, loss = learner.train_policy(num_iterations=30)
+        print("Epoch %d\tReward: %.3f\tLoss: %.3f" % ((i + 1), reward, loss))
+        if i % 10 == 0:
+            learner.save_model()
+    learner.generate_trajectory(True)
 
-    print(states)
-    print(predicted)
-    print(learner.prev_rewards)
-    print(np.mean(learner.prev_rewards))
-    print(np.std(learner.prev_rewards))
+    # for i in range(30):
+    #     learner.get_human_preference()
+    #     reward, loss = learner.train_both(iterations=100, ratio=5)
+    #     print("Reward: %.3f\t Reward Loss: %.3f" % (reward, loss))
 
-    print(learner.database.database['ratings'])
-    print(learner.database.database['s1_lengths'][:5])
-    print(learner.database.database['s2_lengths'][:5])
+    # states, actions, length, total_reward = learner.generate_segment()
+    # predicted = learner.session.run([learner.predicted_rewards], feed_dict={
+    #     learner.state_input: states,
+    #     learner.actions_input: actions
+    # })
+    #
+    # print(states)
+    # print(predicted)
+    # print(learner.prev_rewards)
+    # print(np.mean(learner.prev_rewards))
+    # print(np.std(learner.prev_rewards))
+    #
+    # print(learner.database.database['ratings'])
+    # print(learner.database.database['s1_lengths'][:5])
+    # print(learner.database.database['s2_lengths'][:5])
 
-    learner.game.render(mode='human')
+    return learner
 
 
 if __name__ == '__main__':
-    main()
+    l = main()
