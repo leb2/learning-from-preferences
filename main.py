@@ -2,8 +2,8 @@ import numpy as np
 import tensorflow as tf
 import random
 
-from environments import MultipleEnvironment, GymEnvironmentWrapper
-from actorcritic import BasicActorCritic
+from environments import MultipleEnvironment, GymEnvironmentWrapper, MusicEnvironment
+from actorcritic import BasicActorCritic, ConvActorCritic
 
 
 class Database:
@@ -31,7 +31,7 @@ class Learner:
         self.num_actions = self.environments.num_actions
         self.state_shape = self.environments.state_shape
 
-        self.discount_factor = 0.99
+        self.discount_factor = 0.95
         self.segment_length = 10
 
         self.database = Database()
@@ -47,9 +47,9 @@ class Learner:
         self.discounted_reward_input = tf.placeholder(tf.float32, [self.num_games, None],
                                                       name='discounted_reward_input')
 
-        # self.actor_critic = BasicActorCritic(self.game, shared_architecture=(32, 32), architecture=())
         self.actor_critic = BasicActorCritic(self.num_actions, self.state_shape,
-                                             shared_architecture=[], architecture=[128, 128])
+                                             shared_architecture=[], architecture=[64, 32])
+        # self.actor_critic = ConvActorCritic(self.num_actions, self.state_shape)
 
         actions_one_hot = tf.one_hot(self.actions_input, self.num_actions)
         self.predicted_rewards = self.reward(self.state_input, actions_one_hot)
@@ -109,8 +109,8 @@ class Learner:
         self.session.run(tf.global_variables_initializer())
         self.saver = tf.train.Saver()
 
-    def render(self):
-        self.environments.render(self.policy, max_steps=1000)
+    def render(self, steps=100):
+        self.environments.render(self.policy, max_steps=steps)
 
     def policy(self, states):
         """
@@ -151,7 +151,7 @@ class Learner:
         losses = np.zeros(3)
 
         for i in range(num_iterations):
-            states, actions, rewards, terminals = self.environments.generate_trajectory(self.policy, max_steps=500)
+            states, actions, rewards, terminals = self.environments.generate_trajectory(self.policy, max_steps=300)
             non_terminals = 1 - terminals
 
             # TODO: this depends on the parameters and should be included in back propagation
@@ -256,20 +256,22 @@ def main():
     # env_name = 'Assault-ram-v0'
     # env_name = 'CartPole-v0'
     # env_name = 'MountainCar-v0'
-    env_name = 'LunarLander-v2'
+    # env_name = 'LunarLander-v2'
     # env_name = 'Pong-ram-v0'
+    env_name = 'Pong-v0'
 
-    learner = Learner(lambda: GymEnvironmentWrapper(env_name))
-    learner.load_model()
+    # learner = Learner(lambda: GymEnvironmentWrapper(env_name))
+    learner = Learner(MusicEnvironment)
+    # learner.load_model()
 
     # for i in range(30):
     #     learner.get_human_preference()
 
     for i in range(500):
         learner.render()
-        # reward, loss = learner.train_policy(num_iterations=100)
-        # learner.save_model()
-        # print("Epoch %d\tReward: %.3f\tLoss: %.3f" % ((i + 1), reward, loss))
+        reward, loss = learner.train_policy(num_iterations=10)
+        learner.save_model()
+        print("Epoch %d\tReward: %.3f\tLoss: %.3f" % ((i + 1), reward, loss))
 
     # for i in range(30):
     #     learner.get_human_preference()

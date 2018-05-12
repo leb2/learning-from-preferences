@@ -10,23 +10,89 @@ class Environment(ABC):
         self.state_shape = state_shape
 
     @abstractmethod
-    def step(self, actions):
+    def step(self, action):
         """
+        :param action: an integer representing action index
         :return: states, reward, done
         """
         pass
 
     @abstractmethod
     def render(self):
+        """
+        Function called at each time step when rendering is enabled
+        :return:
+        """
         pass
 
     @abstractmethod
     def close(self):
+        """
+        Function called when rendering completes
+        """
         pass
 
     @abstractmethod
     def reset(self):
+        """
+        Reset the environment to initial state (for episodic environments)
+        """
         pass
+
+
+class MusicEnvironment(Environment):
+    def __init__(self):
+        self.words = list('-tyuiasdfgh')
+        self.word_indices = {i: word for i, word in enumerate(self.words)}
+        self.num_prev = 5
+
+        num_actions = len(self.words)
+        state_shape = [self.num_prev * len(self.words)]
+        super().__init__(num_actions, state_shape)
+
+        self.state = self.start_state()
+        self.render_buffer = []
+
+    def reward(self, state, action):
+        prev_notes = self.state_to_notes(state)
+        prev_note = prev_notes[-1]
+        action_note = self.word_indices[action]
+
+        return float(action_note == '-' and prev_note != '-')
+
+    def step(self, action):
+        action = int(action)
+        reward = self.reward(self.state, action)
+
+        state = np.pad(self.state, ((0, 1), (0, 0)), mode='constant')[1:, :]
+        state[-1, action] = 1
+        self.state = state
+
+        return state.flatten(), reward, False
+
+    def render(self):
+        action = self.state_to_notes(self.state)[-1]
+        self.render_buffer.append(action)
+
+    def close(self):
+        print(''.join(self.render_buffer))
+        self.render_buffer = []
+
+    def reset(self):
+        self.state = self.start_state()
+        return self.state.flatten()
+
+    def state_to_notes(self, state):
+        indices = []
+        for time_step in state:
+            index = list(time_step).index(1)
+            indices.append(self.word_indices[index])
+        return ''.join(indices)
+
+    def start_state(self):
+        state = np.zeros([self.num_prev, len(self.words)])
+        state[:, 0] = 1
+        return state
 
 
 class GymEnvironmentWrapper(Environment):
