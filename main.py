@@ -2,6 +2,8 @@ import gym
 import numpy as np
 import tensorflow as tf
 import random
+import gym.spaces
+
 from abc import ABC, abstractmethod
 
 
@@ -20,10 +22,140 @@ class Database:
         return self.database.__getitem__(item)
 
 
+class Environment(ABC):
+    def __init__(self, num_actions, state_shape):
+        self.num_actions = num_actions
+        self.state_shape = state_shape
+
+    @abstractmethod
+    def step(self, actions):
+        """
+        :return: states, reward, done
+        """
+        pass
+
+    @abstractmethod
+    def render(self):
+        pass
+
+    @abstractmethod
+    def close(self):
+        pass
+
+    @abstractmethod
+    def reset(self):
+        pass
+
+
+class GymEnvironmentWrapper(Environment):
+    def __init__(self, env_name):
+        self.game = gym.make(env_name)
+        self.done = False
+        self.state = None
+
+        super().__init__(self.game.action_space.n, self.game.observation_space.shape)
+
+    def step(self, action):
+        reward = 0
+        state = self.state
+        done = True
+
+        if not self.done:
+            state, reward, done, _ = self.game.step(action)
+            self.state = state
+            self.done = done
+
+        return state, reward, done
+
+    def render(self):
+        self.game.render()
+
+    def close(self):
+        self.game.close()
+
+    def reset(self):
+        self.done = False
+        self.state = self.game.reset()
+        return self.state
+
+
+class MultipleEnvironment:
+    def __init__(self, env_factory, num_instances=1):
+        assert num_instances != 0
+        self.num_instances = num_instances
+        self.env_factory = env_factory
+        self.environments = [self.env_factory() for _ in range(num_instances)]
+        self.num_actions = self.environments[0].num_actions
+        self.state_shape = self.environments[0].state_shape
+
+        self.state = self.reset()
+
+    def reset(self):
+        states = []
+        for environment in self.environments:
+            states.append(environment.reset())
+        self.state = states
+        return states
+
+    def step(self, actions):
+        """
+        :param actions: array of actions of shape [num_instances, num_actions]
+        :return states: array of shape [num_instances, *state_shape]
+                rewards: array of shape [num_instances]
+               done: array of booleans with shape [num_instances]
+        """
+        assert (len(actions) == self.num_instances)
+        states, rewards, dones = zip(*[self.environments[i].step(actions[i]) for i in range(self.num_instances)])
+        return np.array(states), np.array(rewards), np.array(dones)
+
+    def render(self, policy, max_steps):
+        print("RENDERING")
+        env = self.env_factory()
+        state = env.reset()
+        for _ in range(max_steps):
+            env.render()
+            state, _, done = env.step(np.squeeze(policy(state[np.newaxis])))
+            if done:
+                break
+        env.close()
+
+    def generate_trajectory(self, policy, max_steps, reset=True):
+        """
+        :param reset: Boolean whether to reset environments before generating trajectory
+        :param max_steps: Steps to generate trajectory up to
+        :param policy: A function from states [num_iterations, *state_shape] to actions [num_iterations, num_actions]
+        :return states: An array of shape [num_instances, steps + 1, *state_shape],
+                dones: An array of shape [num_instances, steps + 1]
+                actions: An array of shape [num_instances, steps, num_actions]
+                rewards: An array of shape [num_instances, steps]
+                In each case, steps is the number of steps it takes to reach terminal or the max_steps
+        """
+        state = self.reset() if reset else self.state
+
+        states, actions, rewards, dones = [], [], [], []
+        dones = [np.zeros(self.num_instances, dtype=bool)]
+
+        for i in range(max_steps):
+            action = policy(state)
+            states.append(state)
+
+            state, reward, done = self.step(action)
+            actions.append(action)
+            rewards.append(reward)
+            dones.append(done)
+
+            if all(done):
+                break
+
+        states.append(state)
+        self.state = state
+        return tuple(np.stack(values, axis=1) for values in (states, actions, rewards, dones))
+
+
 class ActorCritic(ABC):
-    def __init__(self, game):
-        self.num_actions = game.action_space.n
-        self.state_shape = game.observation_space.shape
+    def __init__(self, num_actions, state_shape):
+        self.num_actions = num_actions
+        self.state_shape = state_shape
 
     @abstractmethod
     def actor(self, state):
@@ -35,8 +167,8 @@ class ActorCritic(ABC):
 
 
 class BasicActorCritic(ActorCritic):
-    def __init__(self, game, architecture=(32, 32), shared_architecture=()):
-        super().__init__(game)
+    def __init__(self, num_actions, state_shape, architecture=(32, 32), shared_architecture=()):
+        super().__init__(num_actions, state_shape)
         self.architecture = architecture
         self.shared_architecture = shared_architecture
 
@@ -52,7 +184,7 @@ class BasicActorCritic(ActorCritic):
             for i, layer_size in enumerate(self.architecture):
                 state = tf.layers.dense(state, layer_size, activation=tf.nn.tanh, name='critic%d' % i)
             state = tf.layers.dense(state, 1, activation=None, name='output')
-        return tf.squeeze(state)
+        return tf.squeeze(state, axis=-1)
 
     def actor(self, state):
         state = self.shared_layers(state)
@@ -64,9 +196,6 @@ class BasicActorCritic(ActorCritic):
 
 
 class ConvActorCritic(ActorCritic):
-    def __init__(self, game):
-        super().__init__(game)
-
     @staticmethod
     def shared_layers(state):
         with tf.variable_scope('ac_shared', reuse=tf.AUTO_REUSE):
@@ -90,69 +219,60 @@ class ConvActorCritic(ActorCritic):
 
 
 class Learner:
-    def __init__(self, game):
+    def __init__(self, env_factory):
         tf.reset_default_graph()
-        self.batch_size = 30
-        self.game = game
-        self.gamma = 1
 
-        self.num_actions = game.action_space.n
-        self.state_shape = game.observation_space.shape
+        self.num_games = 4
+        self.environments = MultipleEnvironment(env_factory, num_instances=self.num_games)
 
+        self.num_actions = self.environments.num_actions
+        self.state_shape = self.environments.state_shape
+
+        self.discount_factor = 0.99
         self.segment_length = 10
 
         self.database = Database()
         self.prev_rewards = [0]
 
-        self.state_input = tf.placeholder(tf.float32, shape=[None, *self.state_shape], name='state_input')
-        self.actions_input = tf.placeholder(shape=[None], dtype=tf.int32, name='actions_input')
+        self.state_input = tf.placeholder(tf.float32, [None, None, *self.state_shape], name='state_input')
+        self.actions_input = tf.placeholder(tf.int32, [self.num_games, None], name='actions_input')
+        self.non_terminals_input = tf.placeholder(tf.float32, [self.num_games, None], name='terminated_input')
+
         self.reward_mean = tf.placeholder(tf.float32, [], name='reward_mean')
         self.reward_std = tf.placeholder(tf.float32, [], name='reward_std')
         self.reward_input = tf.placeholder(tf.float32, [None], name='reward_input')
-        self.discounted_reward_input = tf.placeholder(tf.float32, [None], name='discounted_reward_input')
+        self.discounted_reward_input = tf.placeholder(tf.float32, [self.num_games, None],
+                                                      name='discounted_reward_input')
 
         # self.actor_critic = BasicActorCritic(self.game, shared_architecture=(32, 32), architecture=())
-        self.actor_critic = BasicActorCritic(self.game, shared_architecture=[], architecture=[64, 64])
+        self.actor_critic = BasicActorCritic(self.num_actions, self.state_shape,
+                                             shared_architecture=[], architecture=[128, 128])
 
         actions_one_hot = tf.one_hot(self.actions_input, self.num_actions)
         self.predicted_rewards = self.reward(self.state_input, actions_one_hot)
 
         # -- CRITIC -- #
-        state_value = self.actor_critic.critic(self.state_input)
+        self.state_value = self.actor_critic.critic(self.state_input)
 
         # normalized_reward = (self.predicted_rewards - self.reward_mean) / self.reward_std + 1
-        normalized_reward = self.reward_input
-
-        # One-step Advantage
-        next_state_value = self.gamma * tf.concat([state_value[1:], [0]], axis=0)
-        td_advantage = normalized_reward + next_state_value - state_value
-
-        self.next_state_value = next_state_value
-
-        # Monte Carlo Advantage
-        # cumulative = tf.cumsum(normalized_reward, reverse=True)
-        # advantage = cumulative - tf.squeeze(state_value)
-        mc_advantage = self.discounted_reward_input - state_value
-
-        self.state_value = state_value
-        self.td_advantage = td_advantage
-        self.mc_advantage = mc_advantage
+        advantage = self.discounted_reward_input - self.state_value
 
         # -- ACTOR -- #
-        output = self.actor_critic.actor(self.state_input)
-        action_probs = tf.reduce_sum(output * actions_one_hot, axis=1)
+        self.actor_probs = self.actor_critic.actor(self.state_input)
+        action_probs = tf.reduce_sum(self.actor_probs * actions_one_hot, axis=-1)
 
         # -- TRAINING -- #
-        self.entropy_bonus = tf.reduce_mean(0.01 * self.entropy(output))
-
-        # self.critic_loss = tf.reduce_mean(tf.square(advantage))
-        self.critic_loss = tf.reduce_mean(tf.square(td_advantage))
-        self.actor_loss = -tf.reduce_mean(tf.log(action_probs) * tf.stop_gradient(td_advantage))
+        self.entropy_bonus = tf.reduce_sum(0.01 * self.entropy(self.actor_probs))
+        self.critic_loss = tf.reduce_sum(tf.square(advantage * self.non_terminals_input))
+        self.actor_loss = -tf.reduce_sum(tf.log(action_probs) * tf.stop_gradient(advantage)
+                                         * self.non_terminals_input)
 
         self.loss = self.actor_loss - self.entropy_bonus + self.critic_loss
 
         optimizer = tf.train.AdamOptimizer(learning_rate=0.001)
-        self.train_op = optimizer.minimize(self.loss)
+        gradients, variables = zip(*optimizer.compute_gradients(self.loss))
+        gradients, _ = tf.clip_by_global_norm(gradients, 5.0)
+        self.train_op = optimizer.apply_gradients(zip(gradients, variables))
 
         # -- TRAIN REWARD -- #
         self.ratings_input = tf.placeholder(tf.float32, [None, 2])
@@ -186,6 +306,20 @@ class Learner:
         self.session.run(tf.global_variables_initializer())
         self.saver = tf.train.Saver()
 
+    def render(self):
+        self.environments.render(self.policy, max_steps=1000)
+
+    def policy(self, states):
+        """
+        :param states: Array of shape [num_instances, *state_shape]
+        :return: Array of actions with shape [num_instances, num_actions]
+        """
+        action_probs = self.session.run(self.actor_probs, feed_dict={
+            self.state_input: np.array(np.expand_dims(states, axis=1))
+        })
+        action_probs = np.squeeze(action_probs, axis=1)
+        return np.stack([np.random.choice(self.num_actions, p=action_prob) for action_prob in action_probs])
+
     def save_model(self):
         save_path = self.saver.save(self.session, 'saves/model.ckpt')
         print("Model Saved in %s" % save_path)
@@ -207,79 +341,52 @@ class Learner:
             logits = tf.layers.dense(actions, 1, name='output')
         return tf.squeeze(logits)
 
-    def generate_trajectory(self, render=False, greedy=False):
-        state = self.game.reset()
-        rewards, actions, states = [], [], []
-        total_reward = 0
-        for step in range(3000):
-            if render:
-                self.game.render()
-            probabilities = self.session.run(self.output_inf, feed_dict={
-                self.state_inf: state
-            })
-
-            if greedy:
-                action = np.argmax(probabilities)
-            else:
-                action = np.random.choice(self.num_actions, p=probabilities)
-            # action = np.random.choice(self.num_actions)
-
-            actions.append(action)
-            states.append(state)
-            state, reward, done, _ = self.game.step(action)
-
-            rewards.append(reward)
-            total_reward += reward
-
-            if done:
-                break
-        if render:
-            self.game.close()
-
-        return np.array(states), np.array(actions), np.array(rewards), total_reward
-
     def train_policy(self, num_iterations=1):
-        average = 0
+        average_reward = 0
         average_loss = 0
 
         losses = np.zeros(3)
 
         for i in range(num_iterations):
-            # sys.stdout.write("game: %d of %d \r" % (i, num_iterations))
+            states, actions, rewards, terminals = self.environments.generate_trajectory(self.policy, max_steps=500)
+            non_terminals = 1 - terminals
 
-            states, actions, rewards, total_reward = self.generate_trajectory()
-            discounted_rewards = [0.0]
+            # TODO: this depends on the parameters and should be included in back propagation
+            # Calculate the values for the last time step for each run and use it if state is non-terminal
+            bootstrap_values = self.session.run(self.state_value, feed_dict={
+                self.state_input: states[:, [-1], :]
+            }) * non_terminals[:, [-1]]
 
-            for j, reward in enumerate(rewards):
-                discounted_rewards[0] += reward * self.gamma ** j
+            discounted_rewards = np.copy(rewards)
+            prev = np.squeeze(bootstrap_values)
 
-            for j in range(1, len(rewards)):
-                discounted_rewards.append(float(discounted_rewards[j - 1] - rewards[j - 1]) / self.gamma)
+            for j in range(1, states.shape[1]):
+                discounted_rewards[:, -j] += prev * self.discount_factor
+                prev = discounted_rewards[:, -j]
 
             fetches = [self.loss, self.predicted_rewards, self.train_op,
                        self.actor_loss, self.critic_loss, self.entropy_bonus,
-                       self.td_advantage, self.mc_advantage, self.state_value, self.next_state_value]
+                       self.state_value]
 
             results = self.session.run(fetches, feed_dict={
-                self.state_input: np.array(states),
-                self.actions_input: np.array(actions),
-                self.reward_input: np.array(rewards),
-                self.discounted_reward_input: np.array(discounted_rewards),
-                self.reward_mean: np.mean(self.prev_rewards),
-                self.reward_std: np.std(self.prev_rewards) + 0.00001
+                self.state_input: states[:, :-1, :],
+                self.non_terminals_input: non_terminals[:, :-1],
+                self.actions_input: actions,
+                self.discounted_reward_input: discounted_rewards
             })
+
             loss, predicted_rewards, _, actor_loss, critic_loss, entropy_bonus = results[:6]
-            td_advantage, mc_advantage, state_values, next_state_value = results[6:]
+            state_value = results[6:]  # For debug purposes
 
             self.prev_rewards = self.prev_rewards + list(predicted_rewards)
             self.prev_rewards = self.prev_rewards[-100:]
             losses += np.array([actor_loss, critic_loss, entropy_bonus])
 
+            average_reward += np.sum(np.mean(rewards, axis=0))
             average_loss += loss
-            average += total_reward
 
-        print("Actor Loss: %.3f\t Critic Loss %.3f\t Entropy Bonus %.3f" % tuple(losses / num_iterations))
-        return average / num_iterations, average_loss / num_iterations
+        print("\nActor Loss: %.3f\t Critic Loss %.3f\t Entropy Bonus %.3f" % tuple(losses / num_iterations))
+        return average_reward / num_iterations, average_loss / num_iterations
 
     def train_reward(self):
         num_prev = 100
@@ -343,24 +450,21 @@ class Learner:
 
 
 def main():
-    # environment = gym.make('Assault-ram-v0')
-    # environment = gym.make('CartPole-v0')
-    # environment = gym.make('MountainCar-v0')
-    environment = gym.make('Pong-ram-v0')
-    # learner = Learner(gym.make('LunarLander-v2'))
-
-    learner = Learner(environment)
-    # learner.load_model()
+    # env_name = 'Assault-ram-v0'
+    # env_name = 'CartPole-v0'
+    # env_name = 'MountainCar-v0'
+    env_name = 'LunarLander-v2'
+    # env_name = 'Pong-ram-v0'
+    learner = Learner(lambda: GymEnvironmentWrapper(env_name))
 
     # for i in range(30):
     #     learner.get_human_preference()
 
-    for i in range(1000):
-        reward, loss = learner.train_policy(num_iterations=30)
+    for i in range(500):
+        learner.render()
+        reward, loss = learner.train_policy(num_iterations=100)
+        learner.save_model()
         print("Epoch %d\tReward: %.3f\tLoss: %.3f" % ((i + 1), reward, loss))
-        if i % 10 == 0:
-            learner.save_model()
-    learner.generate_trajectory(True)
 
     # for i in range(30):
     #     learner.get_human_preference()
