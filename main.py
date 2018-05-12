@@ -1,10 +1,9 @@
-import gym
 import numpy as np
 import tensorflow as tf
 import random
-import gym.spaces
 
-from abc import ABC, abstractmethod
+from environments import MultipleEnvironment, GymEnvironmentWrapper
+from actorcritic import BasicActorCritic
 
 
 class Database:
@@ -20,202 +19,6 @@ class Database:
 
     def __getitem__(self, item):
         return self.database.__getitem__(item)
-
-
-class Environment(ABC):
-    def __init__(self, num_actions, state_shape):
-        self.num_actions = num_actions
-        self.state_shape = state_shape
-
-    @abstractmethod
-    def step(self, actions):
-        """
-        :return: states, reward, done
-        """
-        pass
-
-    @abstractmethod
-    def render(self):
-        pass
-
-    @abstractmethod
-    def close(self):
-        pass
-
-    @abstractmethod
-    def reset(self):
-        pass
-
-
-class GymEnvironmentWrapper(Environment):
-    def __init__(self, env_name):
-        self.game = gym.make(env_name)
-        self.done = False
-        self.state = None
-
-        super().__init__(self.game.action_space.n, self.game.observation_space.shape)
-
-    def step(self, action):
-        reward = 0
-        state = self.state
-        done = True
-
-        if not self.done:
-            state, reward, done, _ = self.game.step(action)
-            self.state = state
-            self.done = done
-
-        return state, reward, done
-
-    def render(self):
-        self.game.render()
-
-    def close(self):
-        self.game.close()
-
-    def reset(self):
-        self.done = False
-        self.state = self.game.reset()
-        return self.state
-
-
-class MultipleEnvironment:
-    def __init__(self, env_factory, num_instances=1):
-        assert num_instances != 0
-        self.num_instances = num_instances
-        self.env_factory = env_factory
-        self.environments = [self.env_factory() for _ in range(num_instances)]
-        self.num_actions = self.environments[0].num_actions
-        self.state_shape = self.environments[0].state_shape
-
-        self.state = self.reset()
-
-    def reset(self):
-        states = []
-        for environment in self.environments:
-            states.append(environment.reset())
-        self.state = states
-        return states
-
-    def step(self, actions):
-        """
-        :param actions: array of actions of shape [num_instances, num_actions]
-        :return states: array of shape [num_instances, *state_shape]
-                rewards: array of shape [num_instances]
-               done: array of booleans with shape [num_instances]
-        """
-        assert (len(actions) == self.num_instances)
-        states, rewards, dones = zip(*[self.environments[i].step(actions[i]) for i in range(self.num_instances)])
-        return np.array(states), np.array(rewards), np.array(dones)
-
-    def render(self, policy, max_steps):
-        print("RENDERING")
-        env = self.env_factory()
-        state = env.reset()
-        for _ in range(max_steps):
-            env.render()
-            state, _, done = env.step(np.squeeze(policy(state[np.newaxis])))
-            if done:
-                break
-        env.close()
-
-    def generate_trajectory(self, policy, max_steps, reset=True):
-        """
-        :param reset: Boolean whether to reset environments before generating trajectory
-        :param max_steps: Steps to generate trajectory up to
-        :param policy: A function from states [num_iterations, *state_shape] to actions [num_iterations, num_actions]
-        :return states: An array of shape [num_instances, steps + 1, *state_shape],
-                dones: An array of shape [num_instances, steps + 1]
-                actions: An array of shape [num_instances, steps, num_actions]
-                rewards: An array of shape [num_instances, steps]
-                In each case, steps is the number of steps it takes to reach terminal or the max_steps
-        """
-        state = self.reset() if reset else self.state
-
-        states, actions, rewards, dones = [], [], [], []
-        dones = [np.zeros(self.num_instances, dtype=bool)]
-
-        for i in range(max_steps):
-            action = policy(state)
-            states.append(state)
-
-            state, reward, done = self.step(action)
-            actions.append(action)
-            rewards.append(reward)
-            dones.append(done)
-
-            if all(done):
-                break
-
-        states.append(state)
-        self.state = state
-        return tuple(np.stack(values, axis=1) for values in (states, actions, rewards, dones))
-
-
-class ActorCritic(ABC):
-    def __init__(self, num_actions, state_shape):
-        self.num_actions = num_actions
-        self.state_shape = state_shape
-
-    @abstractmethod
-    def actor(self, state):
-        pass
-
-    @abstractmethod
-    def critic(self, state):
-        pass
-
-
-class BasicActorCritic(ActorCritic):
-    def __init__(self, num_actions, state_shape, architecture=(32, 32), shared_architecture=()):
-        super().__init__(num_actions, state_shape)
-        self.architecture = architecture
-        self.shared_architecture = shared_architecture
-
-    def shared_layers(self, state):
-        with tf.variable_scope('shared', reuse=tf.AUTO_REUSE):
-            for i, layer_size in enumerate(self.shared_architecture):
-                state = tf.layers.dense(state, layer_size, activation=tf.nn.tanh, name='shared%d' % i)
-        return state
-
-    def critic(self, state):
-        state = self.shared_layers(state)
-        with tf.variable_scope('critic', reuse=tf.AUTO_REUSE):
-            for i, layer_size in enumerate(self.architecture):
-                state = tf.layers.dense(state, layer_size, activation=tf.nn.tanh, name='critic%d' % i)
-            state = tf.layers.dense(state, 1, activation=None, name='output')
-        return tf.squeeze(state, axis=-1)
-
-    def actor(self, state):
-        state = self.shared_layers(state)
-        with tf.variable_scope('actor', reuse=tf.AUTO_REUSE):
-            for i, layer_size in enumerate(self.architecture):
-                state = tf.layers.dense(state, layer_size, activation=tf.nn.tanh, name='layer%d' % i)
-            probs = tf.layers.dense(state, units=self.num_actions, activation=tf.nn.softmax, name='output')
-        return probs
-
-
-class ConvActorCritic(ActorCritic):
-    @staticmethod
-    def shared_layers(state):
-        with tf.variable_scope('ac_shared', reuse=tf.AUTO_REUSE):
-            logits = tf.layers.conv2d(state, 16, kernel_size=7, strides=3, activation=tf.nn.leaky_relu, name='c1')
-            logits = tf.layers.conv2d(logits, 16, kernel_size=5, strides=2, activation=tf.nn.leaky_relu, name='c2')
-            logits = tf.layers.conv2d(logits, 16, kernel_size=3, activation=tf.nn.leaky_relu, name='c3')
-            logits = tf.layers.conv2d(logits, 16, kernel_size=3, activation=tf.nn.leaky_relu, name='c4')
-            logits = tf.layers.flatten(logits)
-            logits = tf.layers.dense(logits, units=64, activation=tf.nn.leaky_relu, name='d1')
-        return logits
-
-    def critic(self, state):
-        features = self.shared_layers(state)
-        with tf.variable_scope('critic', reuse=tf.AUTO_REUSE):
-            return tf.layers.dense(features, units=1, activation=None, name='output')
-
-    def actor(self, state):
-        features = self.shared_layers(state)
-        with tf.variable_scope('actor', reuse=tf.AUTO_REUSE):
-            return tf.layers.dense(features, units=self.num_actions, activation=tf.nn.softmax, name='output')
 
 
 class Learner:
@@ -455,16 +258,18 @@ def main():
     # env_name = 'MountainCar-v0'
     env_name = 'LunarLander-v2'
     # env_name = 'Pong-ram-v0'
+
     learner = Learner(lambda: GymEnvironmentWrapper(env_name))
+    learner.load_model()
 
     # for i in range(30):
     #     learner.get_human_preference()
 
     for i in range(500):
         learner.render()
-        reward, loss = learner.train_policy(num_iterations=100)
-        learner.save_model()
-        print("Epoch %d\tReward: %.3f\tLoss: %.3f" % ((i + 1), reward, loss))
+        # reward, loss = learner.train_policy(num_iterations=100)
+        # learner.save_model()
+        # print("Epoch %d\tReward: %.3f\tLoss: %.3f" % ((i + 1), reward, loss))
 
     # for i in range(30):
     #     learner.get_human_preference()
