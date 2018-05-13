@@ -8,21 +8,32 @@ class ActorCritic(ABC):
         self.state_shape = state_shape
 
     @abstractmethod
-    def actor(self, state):
+    def actor(self, states):
         """
         Tensorflow operation that maps states to actions
 
-        :param state: State is tensor of shape [num_instances, num_steps, *state_shape]
+        :param states: A tensor of shape [num_instances, num_steps, *state_shape]
         :return: A tensor of shape [num_instances, num_steps, num_actions]
         """
         pass
 
     @abstractmethod
-    def critic(self, state):
+    def critic(self, states):
         """
         Tensorflow operation that maps states to values
 
-        :param state: State is tensor of shape [num_instances, num_steps, *state_shape]
+        :param states: A tensor of shape [num_instances, num_steps, *state_shape]
+        :return: A tensor of shape [num_instances, num_steps]
+        """
+        pass
+
+    @abstractmethod
+    def reward(self, states, actions):
+        """
+        Tensorflow operation that maps states to values
+
+        :param states: A tensor of shape [num_instances, num_steps, *state_shape]
+        :param actions: A one hot tensor of indices of shape [num_instances, num_steps, num_actions]
         :return: A tensor of shape [num_instances, num_steps]
         """
         pass
@@ -42,12 +53,20 @@ class LSTMActorCritic(ActorCritic):
         with tf.variable_scope('%s/critic' % self.name):
             tf.nn.dynamic_rnn(self.cell)
 
+    def reward(self, states, actions):
+        raise NotImplementedError
+
 
 class BasicActorCritic(ActorCritic):
-    def __init__(self, num_actions, state_shape, architecture=(32, 32), shared_architecture=()):
+    def __init__(self, num_actions, state_shape, architecture=(32, 32), shared_architecture=(),
+                 reward_architecture=None, dropout_prob=0, num_ensemble=1):
+
         super().__init__(num_actions, state_shape)
         self.architecture = architecture
         self.shared_architecture = shared_architecture
+        self.reward_architecture = architecture if reward_architecture is None else reward_architecture
+        self.dropout_prob = dropout_prob
+        self.num_ensemble = num_ensemble
 
     # TODO: Reshape
     def shared_layers(self, state):
@@ -71,6 +90,24 @@ class BasicActorCritic(ActorCritic):
                 state = tf.layers.dense(state, layer_size, activation=tf.nn.tanh, name='critic%d' % i)
             state = tf.layers.dense(state, 1, activation=None, name='output')
         return tf.squeeze(state, axis=-1)
+
+    def reward(self, states, actions, use_dropout=None):
+        with tf.variable_scope('reward', reuse=tf.AUTO_REUSE):
+            logits = tf.concat([states, actions], axis=-1)
+            ensemble_total = 0
+
+            for e in range(self.num_ensemble):
+                for i, layer_size in enumerate(self.reward_architecture):
+                    logits = tf.layers.dense(logits, layer_size, activation=tf.nn.tanh,
+                                             kernel_initializer=tf.truncated_normal_initializer(stddev=0.01),
+                                             name='critic%d_e%d' % (i, e))
+                    if use_dropout is not None:
+                        logits = tf.layers.dropout(logits, rate=self.dropout_prob, training=use_dropout)
+                logits = tf.layers.dense(logits, 1, activation=None,
+                                         kernel_initializer=tf.truncated_normal_initializer(stddev=0.01),
+                                         name='output_e%d' % e)
+                ensemble_total += logits
+        return tf.squeeze(ensemble_total, axis=-1) / self.num_ensemble
 
 
 class ConvActorCritic(ActorCritic):
@@ -99,4 +136,7 @@ class ConvActorCritic(ActorCritic):
         with tf.variable_scope('critic', reuse=tf.AUTO_REUSE):
             features = tf.layers.dense(features, units=1, activation=None, name='output')
         return tf.squeeze(features, axis=-1)
+
+    def reward(self, states, actions):
+        raise NotImplementedError
 

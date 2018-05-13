@@ -157,7 +157,6 @@ class MultipleEnvironment:
         return np.array(states), np.array(rewards), np.array(dones)
 
     def render(self, policy, max_steps):
-        print("RENDERING")
         env = self.env_factory()
         state = env.reset()
         for _ in range(max_steps):
