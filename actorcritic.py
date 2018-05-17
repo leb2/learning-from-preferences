@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 import tensorflow as tf
+import numpy as np
 
 
 class ActorCritic(ABC):
@@ -68,8 +69,8 @@ class BasicActorCritic(ActorCritic):
         self.dropout_prob = dropout_prob
         self.num_ensemble = num_ensemble
 
-    # TODO: Reshape
     def shared_layers(self, state):
+        state = tf.reshape(state, tf.concat([tf.shape(state)[:2], [np.prod(self.state_shape)]], axis=0))
         with tf.variable_scope('shared', reuse=tf.AUTO_REUSE):
             for i, layer_size in enumerate(self.shared_architecture):
                 state = tf.layers.dense(state, layer_size, activation=tf.nn.tanh, name='shared%d' % i)
@@ -92,6 +93,7 @@ class BasicActorCritic(ActorCritic):
         return tf.squeeze(state, axis=-1)
 
     def reward(self, states, actions, use_dropout=None):
+        states = self.shared_layers(states)
         with tf.variable_scope('reward', reuse=tf.AUTO_REUSE):
             logits = tf.concat([states, actions], axis=-1)
             ensemble_total = 0
@@ -111,15 +113,27 @@ class BasicActorCritic(ActorCritic):
 
 
 class ConvActorCritic(ActorCritic):
+    def __init__(self, num_actions, state_shape, num_ensemble=1, dropout_prob=0):
+        self.reward_architecture = (32,)
+        self.num_ensemble = num_ensemble
+        self.dropout_prob = dropout_prob
+
+        self.filters = [16, 16, 16, 16]
+        self.kernel_sizes = [7, 5, 3, 3]
+        self.strides = [3, 2, 1, 1]
+        self.architecture = list(zip(range(len(self.filters)), self.filters, self.kernel_sizes, self.strides))
+
+        super().__init__(num_actions, state_shape)
+
     def shared_layers(self, state):
         batch_shape = tf.shape(state)[:-len(self.state_shape)]
         logits = tf.reshape(state, [-1, *self.state_shape])
 
         with tf.variable_scope('ac_shared', reuse=tf.AUTO_REUSE):
-            logits = tf.layers.conv2d(logits, 16, kernel_size=7, strides=3, activation=tf.nn.leaky_relu, name='c1')
-            logits = tf.layers.conv2d(logits, 16, kernel_size=5, strides=2, activation=tf.nn.leaky_relu, name='c2')
-            logits = tf.layers.conv2d(logits, 16, kernel_size=3, activation=tf.nn.leaky_relu, name='c3')
-            logits = tf.layers.conv2d(logits, 16, kernel_size=3, activation=tf.nn.leaky_relu, name='c4')
+            for i, filters, kernel_size, strides in self.architecture:
+                logits = tf.layers.conv2d(logits, filters, kernel_size, strides, activation=tf.nn.leaky_relu,
+                                          kernel_initializer=tf.truncated_normal_initializer(stddev=0.01),
+                                          name='conv%d' % i)
             logits = tf.layers.flatten(logits)
             logits = tf.layers.dense(logits, units=64, activation=tf.nn.leaky_relu, name='d1')
 
@@ -137,6 +151,22 @@ class ConvActorCritic(ActorCritic):
             features = tf.layers.dense(features, units=1, activation=None, name='output')
         return tf.squeeze(features, axis=-1)
 
-    def reward(self, states, actions):
-        raise NotImplementedError
+    def reward(self, states, actions, use_dropout=None):
+        states = self.shared_layers(states)
+        with tf.variable_scope('reward', reuse=tf.AUTO_REUSE):
+            logits = tf.concat([states, actions], axis=-1)
+            ensemble_total = 0
+
+            for e in range(self.num_ensemble):
+                for i, layer_size in enumerate(self.reward_architecture):
+                    logits = tf.layers.dense(logits, layer_size, activation=tf.nn.tanh,
+                                             kernel_initializer=tf.truncated_normal_initializer(stddev=0.01),
+                                             name='critic%d_e%d' % (i, e))
+                    if use_dropout is not None:
+                        logits = tf.layers.dropout(logits, rate=self.dropout_prob, training=use_dropout)
+                logits = tf.layers.dense(logits, 1, activation=None,
+                                         kernel_initializer=tf.truncated_normal_initializer(stddev=0.01),
+                                         name='output_e%d' % e)
+                ensemble_total += logits
+        return tf.squeeze(ensemble_total, axis=-1) / self.num_ensemble
 

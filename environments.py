@@ -5,9 +5,10 @@ import numpy as np
 
 
 class Environment(ABC):
-    def __init__(self, num_actions, state_shape):
+    def __init__(self, num_actions, state_shape, max_steps=300):
         self.num_actions = num_actions
         self.state_shape = state_shape
+        self.max_steps = max_steps
 
     @abstractmethod
     def step(self, action):
@@ -47,7 +48,7 @@ class MusicEnvironment(Environment):
         self.num_prev = 5
 
         num_actions = len(self.words)
-        state_shape = [self.num_prev * len(self.words)]
+        state_shape = [self.num_prev, len(self.words)]
         super().__init__(num_actions, state_shape)
 
         self.state = self.start_state()
@@ -68,7 +69,7 @@ class MusicEnvironment(Environment):
         state[-1, action] = 1
         self.state = state
 
-        return state.flatten(), reward, False
+        return state, reward, False
 
     def render(self):
         action = self.state_to_notes(self.state)[-1]
@@ -80,7 +81,7 @@ class MusicEnvironment(Environment):
 
     def reset(self):
         self.state = self.start_state()
-        return self.state.flatten()
+        return np.copy(self.state)
 
     def state_to_notes(self, state):
         indices = []
@@ -90,18 +91,18 @@ class MusicEnvironment(Environment):
         return ''.join(indices)
 
     def start_state(self):
-        state = np.zeros([self.num_prev, len(self.words)])
+        state = np.zeros(self.state_shape)
         state[:, 0] = 1
         return state
 
 
 class GymEnvironmentWrapper(Environment):
-    def __init__(self, env_name):
+    def __init__(self, env_name, max_steps=300):
         self.game = gym.make(env_name)
         self.done = False
         self.state = None
 
-        super().__init__(self.game.action_space.n, self.game.observation_space.shape)
+        super().__init__(self.game.action_space.n, self.game.observation_space.shape, max_steps=max_steps)
 
     def step(self, action):
         reward = 0
@@ -135,6 +136,7 @@ class MultipleEnvironment:
         self.environments = [self.env_factory() for _ in range(num_instances)]
         self.num_actions = self.environments[0].num_actions
         self.state_shape = self.environments[0].state_shape
+        self.max_steps = self.environments[0].max_steps
 
         self.state = self.reset()
 
@@ -156,20 +158,19 @@ class MultipleEnvironment:
         states, rewards, dones = zip(*[self.environments[i].step(actions[i]) for i in range(self.num_instances)])
         return np.array(states), np.array(rewards), np.array(dones)
 
-    def render(self, policy, max_steps):
+    def render(self, policy):
         env = self.env_factory()
         state = env.reset()
-        for _ in range(max_steps):
+        for _ in range(self.max_steps):
             env.render()
             state, _, done = env.step(np.squeeze(policy(state[np.newaxis])))
             if done:
                 break
         env.close()
 
-    def generate_trajectory(self, policy, max_steps, reset=True):
+    def generate_trajectory(self, policy, reset=True):
         """
         :param reset: Boolean whether to reset environments before generating trajectory
-        :param max_steps: Steps to generate trajectory up to
         :param policy: A function from states [num_iterations, *state_shape] to actions [num_iterations, num_actions]
         :return states: An array of shape [num_instances, steps + 1, *state_shape],
                 dones: An array of shape [num_instances, steps + 1]
@@ -182,7 +183,7 @@ class MultipleEnvironment:
         states, actions, rewards, dones = [], [], [], []
         dones = [np.zeros(self.num_instances, dtype=bool)]
 
-        for i in range(max_steps):
+        for i in range(self.max_steps):
             action = policy(state)
             states.append(state)
 
@@ -197,4 +198,25 @@ class MultipleEnvironment:
         states.append(state)
         self.state = state
         return tuple(np.stack(values, axis=1) for values in (states, actions, rewards, dones))
+
+
+class PongEnvironment(GymEnvironmentWrapper):
+    def __init__(self):
+        super().__init__('Pong-v0', max_steps=400)
+        self.state_shape = list(self.state_shape)
+        self.state_shape[-1] *= 2
+        self.state_shape = tuple(self.state_shape)
+        self.prev_frame = None
+
+    def step(self, action):
+        curr_frame, reward, done = super().step(action)
+        self.prev_frame = np.copy(curr_frame)
+        state = np.concatenate((curr_frame, self.prev_frame), axis=-1)
+        self.prev_frame = curr_frame
+        return state, reward, done
+
+    def reset(self):
+        self.prev_frame = super().reset()
+        return np.concatenate((self.prev_frame, self.prev_frame), axis=-1)
+
 
